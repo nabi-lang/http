@@ -1,0 +1,23 @@
+// Tests: the message model, HTTP/1.1 parsing and smuggling cases,
+// HPACK vectors (RFC 7541 Appendix C), HTTP/2 framing, loopback client
+// and server for each version, over TLS too.
+
+#[cfg(feature = "http1")]
+mod h1;
+#[cfg(all(feature = "http1", feature = "http2"))]
+mod h2;
+#[cfg(feature = "http2")]
+mod hpack;
+mod model;
+#[cfg(all(feature = "http1", feature = "http2", feature = "tls"))]
+mod tls;
+
+pub fn expect(ok: bool, what: str) {
+    if !ok { panic(f"check failed: {what}"); }
+}
+
+/// Whether `f` throws.
+pub fn fails(f: fn() throws) -> bool {
+    try f() catch _ { return true; };
+    false
+}

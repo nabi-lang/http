@@ -1,0 +1,43 @@
+//! HTTP/2 (RFC 9113) over TLS (ALPN "h2") or a plaintext connection with
+//! prior knowledge (h2c). Without the `http2` feature only `Config`
+//! remains.
+
+#[cfg(feature = "http2")]
+pub(pkg) mod frame;
+#[cfg(feature = "http2")]
+pub(pkg) mod hpack;
+#[cfg(feature = "http2")]
+pub(pkg) mod huffman;
+
+#[cfg(feature = "http2")]
+mod engine;
+#[cfg(feature = "http2")]
+mod fields;
+#[cfg(feature = "http2")]
+mod writer;
+
+#[cfg(feature = "http2")]
+pub(pkg) use engine::{serve_conn, ClientConn};
+
+/// HTTP/2 settings. Every field has a default.
+#[derive(Clone)]
+pub struct Config {
+    /// Streams the peer may open at once (server side).
+    pub max_concurrent_streams: u32 = 100u32;
+    /// Receive window of each stream.
+    pub initial_window_size: u32 = 1048576u32;
+    /// Receive window of the connection.
+    pub connection_window_size: u32 = 16777216u32;
+    /// Largest frame payload accepted.
+    pub max_frame_size: u32 = 16384u32;
+    pub max_header_list_size: u32 = 65536u32;
+    /// Huffman-code header strings when shorter.
+    pub huffman: bool = true;
+    /// A server connection without streams closes after this long.
+    pub idle_timeout: Duration | none = Duration::secs(300);
+    pub write_timeout: Duration | none = Duration::secs(60);
+}
+
+/// Stands in for the client connection type without the feature.
+#[cfg(not(feature = "http2"))]
+pub(pkg) struct ClientConn {}

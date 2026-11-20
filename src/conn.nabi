@@ -1,0 +1,302 @@
+// A buffered TCP or TLS connection with deadlines, shared by HTTP/1.1
+// and HTTP/2.
+
+use pkg::error::{HttpError, ErrorKind};
+use pkg::tls::{Link, Op, In, Side};
+use core::future::AsyncFuture;
+use core::io::{IoError, IoErrorKind};
+use std::net::{TcpStream, Shutdown};
+
+/// Read granularity.
+const READ_CHUNK: usize = 16384;
+
+struct Buf {
+    data: List<u8>;
+    /// Start of the unread bytes in `data`.
+    at: usize;
+}
+
+/// A connection plus the bytes read from it and not consumed yet. It has
+/// one owner, which closes it.
+pub(pkg) struct Io {
+    /// The socket, or the TLS connection's end (its tasks own the
+    /// socket).
+    c: TcpStream | Link;
+    st: List<Buf>;
+    /// The protocol ALPN chose (`""`: none, or plaintext).
+    pub alpn: str = "";
+}
+
+pub(pkg) fn io_err(e: IoError) -> HttpError {
+    if e.kind() == IoErrorKind::TimedOut { return HttpError::new(ErrorKind::Timeout, e.message()); }
+    HttpError::new(ErrorKind::Io, e.message())
+}
+
+/// `n` zero bytes, a read buffer.
+pub(pkg) fn zeroed(n: usize) -> List<u8> {
+    let out: List<u8> = List::with_capacity(n);
+    for _ in 0..n { out.push(0u8); }
+    out
+}
+
+#[cfg(feature = "http2")]
+pub(pkg) fn timed_out(what: str) -> HttpError { HttpError::new(ErrorKind::Timeout, f"{what}: timed out") }
+
+/// What is left of `deadline`, at least zero.
+pub(pkg) fn left(deadline: Instant) -> Duration { deadline.duration_since(Instant::now()).max(Duration::ZERO) }
+
+/// `now + d`, or `none`.
+pub(pkg) fn deadline_in(d: Duration | none) -> Instant | none {
+    match d {
+        x: Duration => Instant::now().checked_add(x),
+        none => none,
+    }
+}
+
+/// The earlier of two deadlines.
+pub(pkg) fn earlier(a: Instant | none, b: Instant | none) -> Instant | none {
+    match a {
+        x: Instant => match b {
+            y: Instant => if y < x { y } else { x },
+            none => x,
+        },
+        none => b,
+    }
+}
+
+/// Connect to `host:port` before `deadline`.
+pub(pkg) async fn dial(host: str, port: u16, deadline: Instant | none) throws (HttpError) -> TcpStream {
+    let target = if host.contains(":") { f"[{host}]:{port}" } else { f"{host}:{port}" };
+    let r = await within(connect_res(target), deadline, f"connect {target}");
+    let s = match r {
+        Result::Ok(s) => s,
+        Result::Err(e) => throw io_err(e),
+    };
+    let _ = try? s.set_nodelay(true);
+    s
+}
+
+/// TLS over the fresh socket `s`, handshake done before `deadline`. The
+/// TLS tasks own `s` from here on.
+pub(pkg) async fn start_tls(s: TcpStream, side: Side, deadline: Instant | none) throws (HttpError) -> Io {
+    if !cfg!(feature = "tls") {
+        let _ = try? s.close();
+        throw HttpError::new(ErrorKind::Unsupported, "TLS needs the `tls` feature");
+    }
+    match await within(start_res(s, side), deadline, "TLS handshake") {
+        Result::Ok(r) => match r {
+            l: Link => {
+                let a = l.alpn;
+                Io { c: l, st: [fresh()], alpn: a }
+            },
+            m: str => throw HttpError::new(ErrorKind::Tls, m),
+        },
+        Result::Err(e) => throw io_err(e),
+    }
+}
+
+fn fresh() -> Buf { Buf { data: List::new(), at: 0usize } }
+
+async fn start_res(s: TcpStream, side: Side) -> Result<Link | str, IoError> {
+    try Result::Ok(await pkg::tls::start(s, side)) catch e: IoError { Result::Err(e) }
+}
+
+async fn recv_in(l: Link, deadline: Instant | none) throws (HttpError) -> In {
+    let r = await within(next_res(l), deadline, "read");
+    match r {
+        Result::Ok(x) => x,
+        Result::Err(e) => throw io_err(e),
+    }
+}
+
+async fn next_res(l: Link) -> Result<In, IoError> { Result::Ok(await l.next()) }
+
+async fn ack_res(rx: Receiver<str>) -> Result<str, IoError> { Result::Ok(await rx.recv_async() ?? "connection closed") }
+
+impl Io {
+    pub fn new(s: TcpStream) -> Io { Io { c: s, st: [fresh()] } }
+
+    /// A second `Io` on the same connection with its own (empty) read
+    /// buffer, for writing from another task. Each is closed by its
+    /// owner; closing either ends the connection.
+    pub fn split(self) throws (HttpError) -> Io {
+        match self.c {
+            l: Link => Io { c: l.clone(), st: [fresh()], alpn: self.alpn },
+            s: TcpStream => Io { c: try s.try_clone() catch e: IoError { throw io_err(e); }, st: [fresh()], alpn: self.alpn },
+        }
+    }
+
+    /// Number of unread bytes.
+    pub fn buffered(self) -> usize { self.st[0].data.len() - self.st[0].at }
+
+    /// The unread bytes (a view; valid until the next `fill`).
+    pub fn peek(self) -> Slice<u8> {
+        let b = self.st[0];
+        b.data[b.at:b.data.len()]
+    }
+
+    /// Mark `n` unread bytes read.
+    pub fn consume(self, n: usize) { self.st[0].at = self.st[0].at + n; }
+
+    /// The next `n` unread bytes (there must be that many).
+    pub fn take(self, n: usize) -> List<u8> {
+        let b = self.st[0];
+        let out = b.data[b.at:b.at + n].to_list();
+        self.st[0].at = b.at + n;
+        out
+    }
+
+    /// Read more from the socket; `false` at end of stream.
+    pub async fn fill(self, deadline: Instant | none) throws (HttpError) -> bool {
+        let scratch = zeroed(READ_CHUNK);
+        let n = 0usize;
+        match self.c {
+            l: Link => match try await recv_in(l, deadline) {
+                In::Data(d) => {
+                    scratch = d;
+                    n = d.len();
+                },
+                In::Failed(m) => throw HttpError::new(ErrorKind::Io, m),
+                _ => return false,
+            },
+            s: TcpStream => {
+                n = try await read_some(s, scratch, deadline);
+                if n == 0 { return false; }
+            },
+        }
+        let b = self.st[0];
+        if b.at == b.data.len() {
+            self.st[0] = Buf { data: scratch[0:n].to_list(), at: 0usize };
+        } else if b.at > 0 && b.at * 2 >= b.data.len() {
+            let rest = b.data[b.at:b.data.len()].to_list();
+            rest.extend(scratch[0:n]);
+            self.st[0] = Buf { data: rest, at: 0usize };
+        } else {
+            b.data.extend(scratch[0:n]);
+        }
+        true
+    }
+
+    /// Fill until `n` bytes are unread; throws `Closed` at end of stream.
+    pub async fn need(self, n: usize, deadline: Instant | none) throws (HttpError) {
+        while self.buffered() < n {
+            if !(try await self.fill(deadline)) { throw HttpError::new(ErrorKind::Closed, "connection closed mid-message"); }
+        }
+    }
+
+    pub async fn write(self, data: Slice<u8>, deadline: Instant | none) throws (HttpError) {
+        match self.c {
+            l: Link => {
+                let (atx, arx) = channel::<str>();
+                try l.ops.send(Op::Write(data.to_list(), atx)) catch _ { throw HttpError::new(ErrorKind::Io, "connection closed"); };
+                match await within(ack_res(arx), deadline, "write") {
+                    Result::Ok(m) => if !m.is_empty() { throw HttpError::new(ErrorKind::Io, m); },
+                    Result::Err(e) => throw io_err(e),
+                }
+            },
+            s: TcpStream => {
+                let r = await within(write_res(s, data), deadline, "write");
+                if let Result::Err(e) = r { throw io_err(e); }
+            },
+        }
+    }
+
+    /// Stop both directions: pending reads end. TLS sends close_notify.
+    pub fn shutdown(self) {
+        match self.c {
+            l: Link => { let _ = try? l.ops.send(Op::Close); },
+            s: TcpStream => { let _ = try? s.shutdown(Shutdown::Both); },
+        }
+    }
+
+    /// End the connection; TLS sends close_notify first.
+    pub fn close(self) {
+        match self.c {
+            l: Link => l.close(),
+            s: TcpStream => {
+                let _ = try? s.shutdown(Shutdown::Both);
+                let _ = try? s.close();
+            },
+        }
+    }
+}
+
+async fn read_some(s: TcpStream, buf: List<u8>, deadline: Instant | none) throws (HttpError) -> usize {
+    let r = await within(read_res(s, buf), deadline, "read");
+    match r {
+        Result::Ok(n) => n,
+        Result::Err(e) => throw io_err(e),
+    }
+}
+
+async fn connect_res(target: str) -> Result<TcpStream, IoError> {
+    try Result::Ok(await std::net::tcp_connect_async(target)) catch e: IoError { Result::Err(e) }
+}
+
+async fn read_res(s: TcpStream, buf: List<u8>) -> Result<usize, IoError> {
+    try Result::Ok(await s.read_async(buf)) catch e: IoError { Result::Err(e) }
+}
+
+async fn write_res(s: TcpStream, data: Slice<u8>) -> Result<usize, IoError> {
+    try {
+        await s.write_all_async(data);
+        Result::Ok(data.len())
+    } catch e: IoError { Result::Err(e) }
+}
+
+async fn expire<T>(d: Duration, what: str) -> Result<T, IoError> {
+    await task::sleep(d);
+    Result::Err(IoError::new(IoErrorKind::TimedOut, f"{what}: timed out"))
+}
+
+/// `f`'s result, or a `TimedOut` error at `deadline` (`f` is then
+/// cancelled).
+async fn within<T>(f: AsyncFuture<Result<T, IoError>>, deadline: Instant | none, what: str) -> Result<T, IoError> {
+    match deadline {
+        none => await f,
+        d: Instant => {
+            let (_, x) = await task::select([f, expire::<T>(left(d), what)]);
+            x
+        },
+    }
+}
+
+/// A channel sender that copies of a handle share (a `Sender` itself has
+/// one owner): sends go through a lock, and `close` closes it for all.
+pub(pkg) struct Tx<T> {
+    m: Mutex<List<Sender<T>>>;
+}
+
+impl<T> Tx<T> {
+    pub fn new(s: Sender<T>) -> Tx<T> {
+        let l: List<Sender<T>> = [s];
+        Tx { m: Mutex::new(l) }
+    }
+
+    /// Queue `v`; `false` once closed.
+    pub fn send(self, v: T) -> bool {
+        let ok = false;
+        using g = self.m.lock() {
+            if let s: Sender<T> = g.get().first() {
+                ok = true;
+                try s.send(v) catch _ { ok = false; };
+            }
+        }
+        ok
+    }
+
+    /// A sender of its own on the channel, unless closed.
+    pub fn sender(self) -> Sender<T> | none {
+        let out: Sender<T> | none = none;
+        using g = self.m.lock() {
+            if let s: Sender<T> = g.get().first() { out = s.clone(); }
+        }
+        out
+    }
+
+    pub fn close(self) {
+        using g = self.m.lock() {
+            while let s: Sender<T> = g.get().pop() { s.close(); }
+        }
+    }
+}

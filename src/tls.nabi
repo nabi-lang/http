@@ -1,0 +1,164 @@
+// TLS for `Io`, on `std::net::tls`'s async methods.
+//
+// HTTP/2 reads and writes at once, so each connection is split into
+// its read half and write half, and each half gets a task: a reader and
+// a writer. The rest of the package talks to them over channels.
+//
+// When the writer stops it shuts the socket down both ways (close_notify
+// first), which ends a read still pending, and closes its half; the
+// reader then closes its half, and the socket closes with the second.
+
+#[cfg(feature = "tls")]
+use pkg::conn::zeroed;
+use core::io::IoError;
+#[cfg(feature = "tls")]
+use core::io::IoErrorKind;
+use std::net::TcpStream;
+use std::net::tls;
+#[cfg(feature = "tls")]
+use std::net::{ReadHalf, WriteHalf, Shutdown};
+
+pub(pkg) enum Op {
+    /// Write; the error message, or `""`, goes back on the sender.
+    Write(List<u8>, Sender<str>),
+    Close,
+}
+
+pub(pkg) enum In {
+    Data(List<u8>),
+    End,
+    Failed(str),
+}
+
+/// Who we are in the handshake.
+pub(pkg) enum Side {
+    Client(str, tls::ClientConfig),
+    Server(tls::ServerConfig),
+}
+
+/// The async end of a TLS connection. The connection ends when every
+/// `Link` on it is gone or one sends `Op::Close`.
+pub(pkg) struct Link {
+    pub ops: Sender<Op>;
+    /// A message asks the reader for the next plaintext.
+    reads: Sender<i32>;
+    input: Receiver<In>;
+    /// The protocol ALPN chose (`""`: none).
+    pub alpn: str;
+}
+
+impl Link {
+    /// End the connection (close_notify, then the socket closes).
+    pub fn close(self) {
+        let _ = try? self.ops.send(Op::Close);
+        self.ops.close();
+        self.reads.close();
+    }
+
+    /// Another end on the same connection.
+    pub fn clone(self) -> Link { Link { ops: self.ops.clone(), reads: self.reads.clone(), input: self.input, alpn: self.alpn } }
+
+    /// The next plaintext, or `End` / `Failed`.
+    pub async fn next(self) -> In {
+        try self.reads.send(1) catch _ { return In::End; };
+        await self.input.recv_async() ?? In::End
+    }
+}
+
+/// Handshake over `real` as `side`, then start the reader and writer,
+/// in a task of the pool (not on a `block_on` caller). A failed
+/// handshake gives its message.
+#[cfg(feature = "tls")]
+pub(pkg) async fn start(real: TcpStream, side: Side) throws (IoError) -> Link | str {
+    let (tx, rx) = channel::<Link | str | IoError>();
+    _ = task::spawn(async {
+        let r: Link | str | IoError = try await run(real, side) catch e: tls::TlsError {
+            if e.kind() == tls::TlsErrorKind::Io { IoError::new(IoErrorKind::Other, e.message()) } else { e.message() }
+        };
+        let _ = try? tx.send(r);
+        0
+    });
+    match await rx.recv_async() {
+        l: Link => l,
+        m: str => m,
+        e: IoError => throw e,
+        none => throw IoError::new(IoErrorKind::Other, "TLS handshake task ended"),
+    }
+}
+
+#[cfg(feature = "tls")]
+async fn run(real: TcpStream, side: Side) throws (tls::TlsError) -> Link {
+    let c: tls::Client | tls::Server = match side {
+        Side::Client(name, cfg) => try await tls::Client::with_config_async(real, name, cfg),
+        Side::Server(cfg) => try await tls::Server::new_async(real, cfg),
+    };
+    let alpn = match c {
+        x: tls::Client => x.negotiated_alpn(),
+        x: tls::Server => x.negotiated_alpn(),
+    };
+    let (otx, orx) = channel::<Op>();
+    let (rtx, rrx) = channel::<i32>();
+    let (itx, irx) = channel::<In>();
+    match c {
+        x: tls::Client => {
+            let (r, w) = x.split();
+            _ = task::spawn(writer(w, orx));
+            _ = task::spawn(reader(r, rrx, itx));
+        },
+        x: tls::Server => {
+            let (r, w) = x.split();
+            _ = task::spawn(writer(w, orx));
+            _ = task::spawn(reader(r, rrx, itx));
+        },
+    }
+    Link { ops: otx, reads: rtx, input: irx, alpn: try str::from_utf8(alpn ?? []) catch _ { "" } }
+}
+
+#[cfg(not(feature = "tls"))]
+pub(pkg) async fn start(real: TcpStream, _side: Side) throws (IoError) -> Link | str {
+    try real.close();
+    panic("TLS needs the `tls` feature")
+}
+
+/// One read per request; `input` closes when the connection ends or
+/// no more reads are asked for. Then the read half closes.
+#[cfg(feature = "tls")]
+async fn reader<T>(r: ReadHalf<T>, reads: Receiver<i32>, out: Sender<In>) -> i32 {
+    let buf = zeroed(16384);
+    while await reads.recv_async() is i32 {
+        let n = try await r.read_async(buf) catch e: IoError {
+            let _ = try? out.send(In::Failed(e.message()));
+            break;
+        };
+        if n == 0 { break; }
+        let _ = try? out.send(In::Data(buf[0:n].to_list()));
+    }
+    out.close();
+    let _ = try? await r.close_async();
+    0
+}
+
+/// Writes until `Op::Close` or every `Link` is gone, then shuts the
+/// socket down both ways (close_notify first, and a pending read ends)
+/// and closes the write half.
+#[cfg(feature = "tls")]
+async fn writer<T>(w: WriteHalf<T>, ops: Receiver<Op>) -> i32 {
+    loop {
+        match await ops.recv_async() ?? Op::Close {
+            Op::Write(data, ack) => {
+                let r = try {
+                    await w.write_all_async(data);
+                    ""
+                } catch e: IoError { e.message() };
+                let _ = try? ack.send(r);
+            },
+            Op::Close => break,
+        }
+    }
+    let _ = try? await w.shutdown_async(Shutdown::Both);
+    let _ = try? await w.close_async();
+    while let x: Op = ops.try_recv() {
+        if let Op::Write(_, ack) = x { let _ = try? ack.send("connection closed"); }
+    }
+    0
+}
