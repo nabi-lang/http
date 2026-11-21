@@ -26,6 +26,9 @@ pub(pkg) enum Cmd {
     Reset(u32),
     /// Stop after writing what is ready.
     Close,
+    /// As `Close`, but shut only the sending side: the reader drains
+    /// the peer's rest before the socket is closed.
+    HalfClose,
 }
 
 struct Queued {
@@ -51,7 +54,8 @@ pub(pkg) async fn run(io: Io, rx: Receiver<Cmd>, huffman: bool, timeout: Duratio
         out: List::new(),
         // [connection window, peer's initial window, max frame size]
         nums: [65535i64, 65535i64, 16384i64],
-        flags: [false, false],
+        // [dead, closing, half close]
+        flags: [false, false, false],
     };
     loop {
         let first = await rx.recv_async();
@@ -75,11 +79,11 @@ pub(pkg) async fn run(io: Io, rx: Receiver<Cmd>, huffman: bool, timeout: Duratio
         }
         if w.closing() && !w.dead() {
             w.die();
-            io.shutdown();
+            if w.flags[2] { io.shutdown_write(); } else { io.shutdown(); }
         }
     }
     w.die();
-    io.close();
+    if w.flags[2] { io.release(); } else { io.close(); }
 }
 
 struct W {
@@ -136,6 +140,10 @@ impl W {
                 if !present { self.active.push(sid); }
             },
             Cmd::Close => { self.flags[1] = true; },
+            Cmd::HalfClose => {
+                self.flags[1] = true;
+                self.flags[2] = true;
+            },
             _ => if !self.dead() { self.control(c); },
         }
     }

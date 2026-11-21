@@ -73,6 +73,9 @@ pub(pkg) struct Shared {
     wtask: Task<i32>;
 }
 
+/// How long a connection error waits for the peer's end (`read_loop`).
+const LINGER: Duration = Duration::secs(1);
+
 fn closed_err(msg: str) -> HttpError { HttpError::new(ErrorKind::Closed, msg) }
 
 fn reset_err(code: u32) -> HttpError { HttpError { kind: ErrorKind::Reset, message: f"stream reset (code {code})", code: code } }
@@ -193,7 +196,8 @@ impl Shared {
     }
 
     /// The connection is over: fail every stream, stop the tasks.
-    fn shut(self, why: HttpError) {
+    /// `half`: the writer shuts only the sending side (`Cmd::HalfClose`).
+    fn shut(self, why: HttpError, half: bool) {
         let ids: List<u32> = List::new();
         using g = self.st.lock() {
             let st = g.get();
@@ -202,7 +206,7 @@ impl Shared {
             for k in st.streams.keys() { ids.push(k); }
         }
         for sid in ids { self.fail(sid, why); }
-        self.cmd(Cmd::Close);
+        self.cmd(if half { Cmd::HalfClose } else { Cmd::Close });
         self.w.close();
         self.credit.close();
     }
@@ -240,6 +244,7 @@ impl Shared {
     /// Read frames until the connection ends. `handler`: serve requests
     /// (server); `none`: deliver responses (client).
     async fn read_loop(self, io: Io, handler: Handler | none) {
+        let goaway = false;
         let why = try {
             await self.frames(io, handler);
             closed_err("connection closed")
@@ -247,12 +252,17 @@ impl Shared {
             if e.kind == ErrorKind::Protocol {
                 let last = self.snapshot().last_peer;
                 self.raw(frame::goaway(last, e.code, e.message));
+                goaway = true;
             }
             e
         };
-        self.shut(why);
+        self.shut(why, goaway);
         // Let the writer flush (GOAWAY) before the socket is closed.
         _ = await self.wtask;
+        // Closing on unread input resets the connection, and a reset can
+        // destroy the GOAWAY before the peer reads it (Windows drops
+        // received data on one): read the peer's rest first.
+        if goaway { await io.drain(deadline_in(LINGER)); }
     }
 
     async fn frames(self, io: Io, handler: Handler | none) throws (HttpError) {

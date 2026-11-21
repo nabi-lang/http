@@ -209,6 +209,33 @@ impl Io {
         }
     }
 
+    /// Stop sending (FIN); reading goes on. TLS: as `shutdown`.
+    pub fn shutdown_write(self) {
+        match self.c {
+            l: Link => { let _ = try? l.ops.send(Op::Close); },
+            s: TcpStream => { let _ = try? s.shutdown(Shutdown::Write); },
+        }
+    }
+
+    /// Read and drop what the peer still sends, until its end or
+    /// `deadline`.
+    pub async fn drain(self, deadline: Instant | none) {
+        loop {
+            self.consume(self.buffered());
+            if !(try await self.fill(deadline) catch _ { false }) { break; }
+        }
+        self.consume(self.buffered());
+    }
+
+    /// Close this handle only: another `Io` on the connection (`split`)
+    /// keeps it open. TLS: as `close`.
+    pub fn release(self) {
+        match self.c {
+            l: Link => l.close(),
+            s: TcpStream => { let _ = try? s.close(); },
+        }
+    }
+
     /// End the connection; TLS sends close_notify first.
     pub fn close(self) {
         match self.c {
