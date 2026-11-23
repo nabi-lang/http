@@ -35,7 +35,7 @@ and TLS details.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/http/latest/docs
+https://docs.nabi-lang.org/packages/http/latest
 
 ## License
 
